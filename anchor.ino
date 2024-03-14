@@ -6,8 +6,6 @@ const uint8_t PIN_RST = 15;
 const uint8_t PIN_IRQ = 17;
 const uint8_t PIN_TX = 26;
 const uint8_t PIN_RX = 27;
-const uint64_t deviceAddr = 1;
-const uint64_t antennaDelay = 16346;
 
 SemaphoreHandle_t mutex;
 
