@@ -81,6 +81,7 @@ namespace Anchor{
   void run();
   void printDeviceIdentifier(HardwareSerial&);
   double getDistance();
+  byte* getCirData(byte*);
 };
 
 #endif

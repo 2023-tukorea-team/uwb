@@ -42,6 +42,9 @@
 #include <DW1000Ng.hpp>
 #include <DW1000NgUtils.hpp>
 #include <DW1000NgRanging.hpp>
+#include <DW1000NgConstants.hpp>
+#include <DW1000NgRegisters.hpp>
+#include <SPIporting.hpp>
 
 namespace Anchor{
   // private
@@ -49,7 +52,7 @@ namespace Anchor{
     volatile byte expectedMsgId = POLL;
     volatile boolean sentAck = false;
     volatile boolean receivedAck = false;
-    volatile double distance = 0.0;
+    double distance = 0.0;
     boolean protocolFailed = false;
     uint64_t timePollSent;
     uint64_t timePollReceived;
@@ -62,13 +65,22 @@ namespace Anchor{
     // read and write distance
     SemaphoreHandle_t mutex;
     
-    byte data[LEN_DATA];
+    constexpr uint16_t LEN_FP_INDEX = 2;
+    constexpr uint16_t CIR_FP_INDEX_SUB = 0x05;
+    constexpr uint16_t ACC_MEM = 0x25;
+    constexpr uint16_t LEN_CIR = 4;
+    constexpr uint16_t LEN_PMSC = 4;
+    constexpr uint16_t FACE_BIT = 6;
+    constexpr uint16_t AMCE_BIT = 15;
     uint32_t lastActivity;
     uint32_t resetPeriod = 250;
     uint16_t replyDelayTimeUS = 3000;
     uint16_t successRangingCount = 0;
     uint32_t rangingCountPeriod = 0;
     float samplingRate = 0;
+    uint8_t _ss = 0xff;
+    byte data[LEN_DATA];
+    byte cirDataBytes[LEN_CIR * 64];
       
     void receiver() {
       DW1000Ng::forceTRxOff();
@@ -104,9 +116,52 @@ namespace Anchor{
     void handleReceived() {
       receivedAck = true;
     }
+    void _readBytesFromRegister(byte cmd, uint16_t offset, byte data[], uint16_t data_size) {
+			byte header[3];
+			uint8_t headerLen = 1;
+			
+			// build SPI header
+			if(offset == NO_SUB) {
+				header[0] = READ | cmd;
+			} else {
+				header[0] = READ_SUB | cmd;
+				if(offset < 128) {
+					header[1] = (byte)offset;
+					headerLen++;
+				} else {
+					header[1] = RW_SUB_EXT | (byte)offset;
+					header[2] = (byte)(offset >> 7);
+					headerLen += 2;
+				}
+			}
+			SPIporting::readFromSPI(_ss, headerLen, header, data_size, data);
+		}
+    void _writeBytesToRegister(byte cmd, uint16_t offset, byte data[], uint16_t data_size) {
+			byte header[3];
+			uint8_t headerLen = 1;
+			
+			// TODO proper error handling: address out of bounds
+			// build SPI header
+			if(offset == NO_SUB) {
+				header[0] = WRITE | cmd;
+			} else {
+				header[0] = WRITE_SUB | cmd;
+				if(offset < 128) {
+					header[1] = (byte)offset;
+					headerLen++;
+				} else {
+					header[1] = RW_SUB_EXT | (byte)offset;
+					header[2] = (byte)(offset >> 7);
+					headerLen += 2;
+				}
+			}
+			
+			SPIporting::writeToSPI(_ss, headerLen, header, data_size, data);
+		}
   }
   //public 
   void init(int pinSS, int pinIrq, int pinRst){
+    _ss = pinSS;
     DW1000Ng::initialize(pinSS, pinIrq, pinRst);
     DW1000Ng::applyConfiguration(DEFAULT_CONFIG);
     DW1000Ng::applyInterruptConfiguration(DEFAULT_INTERRUPT_CONFIG);
@@ -114,6 +169,11 @@ namespace Anchor{
     DW1000Ng::setAntennaDelay(ANTENNA_DELAY);
     DW1000Ng::attachSentHandler(handleSent);
     DW1000Ng::attachReceivedHandler(handleReceived);
+    byte pmscBytes[LEN_PMSC];
+    _readBytesFromRegister(PMSC, PMSC_CTRL0_SUB, pmscBytes, LEN_PMSC);
+    pmscBytes[0] |= 1 << FACE_BIT;
+    pmscBytes[1] |= 1 << (AMCE_BIT - sizeof(byte));
+    _writeBytesToRegister(PMSC, PMSC_CTRL0_SUB, pmscBytes, LEN_PMSC);
     mutex = xSemaphoreCreateMutex();
     receiver();
     noteActivity();
@@ -162,17 +222,37 @@ namespace Anchor{
                                                             timePollAckReceived, 
                                                             timeRangeSent, 
                                                             timeRangeReceived);
+
+          byte fpIndex[LEN_FP_INDEX];
+          _readBytesFromRegister(RX_TIME, CIR_FP_INDEX_SUB, fpIndex, LEN_FP_INDEX);
+          uint16_t f = ((uint16_t)fpIndex[0] | ((uint16_t)fpIndex[1] << 8)) >> 6;          
+          String fpIndexString = "fpIndex : "; fpIndexString += f;
+          //Serial.println(fpIndexString);
+
+          int16_t c = 0;
+          byte cirDataBytesTemp[LEN_CIR * 64 + 1];
+          _readBytesFromRegister(ACC_MEM, f * LEN_CIR, cirDataBytesTemp, LEN_CIR * 64 + 1);
   
           xSemaphoreTake(mutex, portMAX_DELAY);
           distance = temp;
+          memcpy(cirDataBytes, &cirDataBytesTemp[1], LEN_CIR * 64);
           xSemaphoreGive(mutex);
           distance = DW1000NgRanging::correctRange(distance);
+
+          byte cirPwrBytes[LEN_CIR_PWR];
+          _readBytesFromRegister(RX_FQUAL, CIR_PWR_SUB, cirPwrBytes, LEN_CIR_PWR);
+
+          int16_t real = *(int16_t*)(&cirDataBytes[0]);
+          int16_t imag = *(int16_t*)(&cirDataBytes[2]);
+          c = sqrt(real * real + imag * imag);
+          String fpCirString = "fpCir : "; fpCirString += c;
+          //Serial.println(fpCirString);
                 
           String rangeString = "Range: "; rangeString += distance; rangeString += " m";
-          Serial.println(rangeString);
+          rangeString += "\t RX power: "; rangeString += DW1000Ng::getReceivePower(); rangeString += " dBm";
+          //Serial.println(rangeString);
           sendRangeAck(distance * DISTANCE_OF_RADIO_INV);
           if (curMillis - rangingCountPeriod > 1000) {
-            samplingRate = (1000.0f * successRangingCount) / (curMillis - rangingCountPeriod);
             rangingCountPeriod = curMillis;
           }
         }
@@ -193,6 +273,14 @@ namespace Anchor{
     xSemaphoreTake(mutex, portMAX_DELAY);
     ret = distance;
     xSemaphoreGive(mutex);
+    return ret;
+  }
+  byte* getCirData(byte* dst){
+    byte* ret = nullptr;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    memcpy(dst, cirDataBytes, LEN_CIR * 64);
+    xSemaphoreGive(mutex);
+    ret = dst;
     return ret;
   }
 }
